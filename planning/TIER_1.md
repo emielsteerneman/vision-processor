@@ -19,17 +19,24 @@ Neither call sets `wrapper.set_source(...)`. The detection-frame publish at `src
 
 **Effect**: lets any consumer disambiguate "geometry packet from a `vision_processor` republish" vs. "geometry packet from the geometry publisher." Eliminates ~80% of the absorb-loop hazard when building tooling around the multicast bus.
 
-### 2. Deterministic serialization for change detection
+### 2. Deterministic serialization for change detection — INVESTIGATED, DROPPED
 
 **Files**: `src/udpsocket.cpp:117`, `src/udpsocket.cpp:153`
 
-`VisionSocket::geometryCheck` and `VisionSocket::parse` use `MessageDifferencer::Equals` to detect changes in received `SSL_GeometryData`. With float fields and non-deterministic protobuf serialization, byte-equal payloads can compare unequal after a roundtrip, causing spurious `geometryVersion` bumps.
+Initial framing was: `MessageDifferencer::Equals` is non-deterministic and float-sensitive, causing spurious `geometryVersion` bumps from serialization noise.
 
-`python/geom_publisher.py:124` already learned this lesson and uses `SerializeToString(deterministic=True)` for its own equality check.
+On reading the actual code, this turned out to be misdiagnosed. `MessageDifferencer::Equals` does **field-level** comparison, not byte-level. For float fields it compares the deserialized float values via `==`. Switching to deterministic-`SerializeAsString`-byte-comparison would not change behaviour for this codebase (proto2, no maps, no presence ambiguity).
 
-**Patch**: switch C++ change-detection to compare `SerializeAsString` outputs with deterministic serialization, or add a monotonic version field on the wrapper and compare that instead.
+The underlying observation about float drift via the quaternion roundtrip in `getProto()` (non-associative IEEE-754 in `f2iOrientation * -pos` and its inverse) is real — `vision_processor` republishes carry slightly different float bits than the original calib it received. But `MessageDifferencer::Equals` correctly detects that drift as "different" because the float values genuinely differ. Switching the comparator does not suppress it.
 
-**Effect**: eliminates spurious version bumps. Each spurious bump triggers `Perspective::geometryCheck` → `image2field` recompute over the full image (`Perspective.cpp:75-88`). Real CPU saved on every camera, every cycle. Also removes the load-bearing assumption behind the defensive guard at `Perspective.cpp:57`.
+The actual fixes for the version-churn would be either:
+- Epsilon-based float comparison (semantic change, debatable)
+- A monotonic version field on the wrapper (proto change — a bigger PR than belongs in Tier 1)
+- Stop the upstream cause of drift entirely, by filtering out `vision_processor` republishes
+
+Patch 1 (set_source on republishes) addresses the wrapper-builder pain by making republishes filterable. Within `vision_processor` itself, the self-loop drift remains a long-standing inefficiency, but it is not a regression and is out of scope for a tier-1-style PR.
+
+This patch is therefore not pursued.
 
 ### 3. `geom_publisher.py` camera_id index bug
 
@@ -51,8 +58,9 @@ A 4-camera setup with ids `[0, 1, 3, 5]` would write camera id 5's calib into li
 
 These are bug fixes for actual defects, not feature additions. Each reduces cognitive load on every other tool that touches this protocol — including any planned Python wrapper. They are small enough to land as upstream PRs and benefit the project independently of the wrapper effort.
 
-Recommended order:
+Patches actually pursued:
 
 1. Patch #1 (set_source) — biggest immediate win for tooling
 2. Patch #3 (geom_publisher index) — silent bug fix
-3. Patch #2 (deterministic equality) — performance + correctness, but more invasive
+
+Patch #2 (deterministic equality) was investigated and dropped — see its section above.
